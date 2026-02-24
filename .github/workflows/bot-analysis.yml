@@ -1,0 +1,203 @@
+name: Windsurf Bot - AI Code Analysis
+
+on:
+  issues:
+    types: [assigned]
+  pull_request:
+    types: [opened, review_requested, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  windsurf-analysis:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.assignees.login, 'windsurf-bot') || contains(github.event.pull_request.requested_reviewers.login, 'windsurf-bot') || github.event.review.user.login == 'windsurf-bot'
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate JWT Token
+        id: jwt
+        run: |
+          # Generate JWT for GitHub App authentication
+          JWT=$(node -e "
+            const jwt = require('jsonwebtoken');
+            const privateKey = \`${{ secrets.WINDSURF_BOT_PRIVATE_KEY }}\`;
+          const appId = ${{ secrets.WINDSURF_BOT_APP_ID }};
+          
+          const payload = {
+            iat: Math.floor(Date.now() / 1000) - 60,
+            exp: Math.floor(Date.now() / 1000) + 600,
+            iss: appId
+          };
+          
+          console.log(jwt.sign(payload, privateKey, { algorithm: 'RS256' }));
+          ")
+          echo "token=$JWT" >> $GITHUB_OUTPUT
+
+      - name: Get Installation Token
+        id: install_token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ steps.jwt.outputs.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/app/installations/${{ secrets.WINDSURF_BOT_INSTALLATION_ID }}/access_tokens \
+            | jq -r '.token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Extract Event Information
+        id: event_info
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "title=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+            echo "author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+            echo "base=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+            echo "head=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+            echo "url=${{ github.event.pull_request.html_url }}" >> $GITHUB_OUTPUT
+            echo "action=${{ github.event.action }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "issues" ]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "title=${{ github.event.issue.title }}" >> $GITHUB_OUTPUT
+            echo "author=${{ github.event.issue.user.login }}" >> $GITHUB_OUTPUT
+            echo "url=${{ github.event.issue.html_url }}" >> $GITHUB_OUTPUT
+            echo "action=${{ github.event.action }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Call Windsurf API
+        id: windsurf_analysis
+        run: |
+          # Prepare the analysis request
+          ANALYSIS_REQUEST=$(jq -n \
+            --arg event_type "${{ github.event_name }}" \
+            --arg action "${{ steps.event_info.outputs.action }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg number "${{ steps.event_info.outputs.number }}" \
+            --arg title "${{ steps.event_info.outputs.title }}" \
+            --arg author "${{ steps.event_info.outputs.author }}" \
+            --arg base "${{ steps.event_info.outputs.base }}" \
+            --arg head "${{ steps.event_info.outputs.head }}" \
+            --arg url "${{ steps.event_info.outputs.url }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              event_type: $event_type,
+              action: $action,
+              repository: $repo,
+              issue_number: ($number | tonumber),
+              title: $title,
+              author: $author,
+              base_branch: $base,
+              head_branch: $head,
+              url: $url,
+              timestamp: $timestamp
+            }')
+
+          echo "Request payload: $ANALYSIS_REQUEST"
+
+          # Call the Windsurf API endpoint
+          ANALYSIS_RESULT=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.WINDSURF_API_TOKEN }}" \
+            -d "$ANALYSIS_REQUEST" \
+            "${{ secrets.WINDSURF_API_URL }}")
+
+          echo "result=$ANALYSIS_RESULT" >> $GITHUB_OUTPUT
+
+          # Log the interaction
+          echo "Analysis completed for ${{ github.event_name }} #${{ steps.event_info.outputs.number }}"
+
+      - name: Create Analysis Comment
+        if: github.event_name == 'pull_request'
+        run: |
+          # Parse analysis results
+          ANALYSIS_RESULT="${{ steps.windsurf_analysis.outputs.result }}"
+          
+          COMMENT_BODY="## 🤖 Windsurf Bot Analysis
+
+          **PR #${{ steps.event_info.outputs.number }}**: ${{ steps.event_info.outputs.title }}
+          **Author**: @${{ steps.event_info.outputs.author }}
+          **Branch**: `${{ steps.event_info.outputs.head }}` → `${{ steps.event_info.outputs.base }}`
+
+          ### 📊 Analysis Status
+          ✅ **Windsurf analysis completed**
+          🔄 **Results processed**
+          📝 **Review generated**
+
+          ### 🔍 Analysis Results
+          \`\`\`json
+          $ANALYSIS_RESULT
+          \`\`\`
+
+          ### 🎯 Next Steps
+          1. Review the analysis findings
+          2. Address any critical issues
+          3. Implement suggested improvements
+          4. Request human review if needed
+
+          ---
+          *Analysis requested by @${{ github.triggering_actor }}*
+          *Powered by Windsurf AI*"
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ steps.install_token.outputs.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.event_info.outputs.number }}/comments \
+            -d "{\"body\": \"$COMMENT_BODY\"}"
+
+      - name: Update Issue Status
+        if: github.event_name == 'issues'
+        run: |
+          # Parse analysis results
+          ANALYSIS_RESULT="${{ steps.windsurf_analysis.outputs.result }}"
+          
+          COMMENT_BODY="## 🤖 Windsurf Bot Assignment
+
+          **Issue #${{ steps.event_info.outputs.number }}**: ${{ steps.event_info.outputs.title }}
+          **Assigned by**: @${{ github.triggering_actor }}
+
+          ### 📋 Analysis Complete
+          I've analyzed this issue and prepared an implementation plan.
+
+          ### 🔍 Analysis Results
+          \`\`\`json
+          $ANALYSIS_RESULT
+          \`\`\`
+
+          ### 🎯 Implementation Plan
+          Based on the analysis, I'll:
+          1. **Review Requirements** - Validate understanding
+          2. **Design Solution** - Plan implementation approach
+          3. **Write Code** - Implement the solution
+          4. **Add Tests** - Ensure quality
+          5. **Request Review** - Human validation
+
+          ### 💬 Communication
+          I'll provide updates via comments as I progress through the solution.
+
+          ---
+          *Assigned to Windsurf Bot*
+          *AI-powered development assistant*"
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ steps.install_token.outputs.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.event_info.outputs.number }}/comments \
+            -d "{\"body\": \"$COMMENT_BODY\"}"
+
+      - name: Log Analysis Trigger
+        run: |
+          echo "🤖 Windsurf Bot Analysis Completed!"
+          echo "Event: ${{ github.event_name }}"
+          echo "Action: ${{ github.event.action }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Triggered by: @${{ github.triggering_actor }}"
+          echo "PR/Issue: #${{ steps.event_info.outputs.number }}"
+          echo "Analysis URL: ${{ secrets.WINDSURF_API_URL }}"
